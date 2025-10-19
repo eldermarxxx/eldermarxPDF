@@ -1,218 +1,211 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from supabase import create_client
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import A4, landscape
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
-from supabase import create_client, Client
-from io import BytesIO
+from reportlab.lib.units import cm
+from reportlab.lib.enums import TA_CENTER
+import io
 from datetime import datetime
-import os
+import re
 
-# Criar app FastAPI
-app = FastAPI(
-    title="Supabase PDF Report Generator",
-    description="API para gerar relatórios PDF a partir de dados do Supabase",
-    version="1.0.0"
-)
+app = Flask(__name__)
+CORS(app)
 
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def sanitize_text(text):
+    """Remove caracteres especiais que podem causar problemas no PDF"""
+    if text is None:
+        return ""
+    text = str(text)
+    text = re.sub(r'[^\x00-\x7F]+', ' ', text)
+    return text
 
-class ReportRequest(BaseModel):
-    table_name: str
-    fields: List[str]
-    supabase_url: str
-    anon_key: str
-    report_title: Optional[str] = None
+def format_value(value):
+    """Formata valores para exibição no PDF"""
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return "Sim" if value else "Não"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        if len(value) > 100:
+            return value[:97] + "..."
+        return value
+    return str(value)
 
-def create_apple_style_pdf(data: List[dict], fields: List[str], title: str) -> BytesIO:
-    """Cria um PDF com estilo minimalista inspirado na Apple"""
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, 
-                           rightMargin=50, leftMargin=50,
-                           topMargin=50, bottomMargin=50)
+def create_pdf(data, table_name, fields):
+    """Cria um PDF elegante com os dados"""
+    buffer = io.BytesIO()
+    
+    pagesize = landscape(A4) if len(fields) > 5 else A4
+    doc = SimpleDocTemplate(buffer, pagesize=pagesize, 
+                           topMargin=1.5*cm, bottomMargin=1.5*cm,
+                           leftMargin=2*cm, rightMargin=2*cm)
     
     elements = []
     styles = getSampleStyleSheet()
     
-    # Estilo do título (Apple-like)
     title_style = ParagraphStyle(
         'CustomTitle',
         parent=styles['Heading1'],
-        fontSize=28,
-        textColor=colors.HexColor('#1d1d1f'),
+        fontSize=24,
+        textColor=colors.HexColor('#1a1a1a'),
         spaceAfter=30,
         alignment=TA_CENTER,
         fontName='Helvetica-Bold'
     )
     
-    # Estilo da data
-    date_style = ParagraphStyle(
-        'DateStyle',
+    subtitle_style = ParagraphStyle(
+        'CustomSubtitle',
         parent=styles['Normal'],
         fontSize=10,
-        textColor=colors.HexColor('#86868b'),
+        textColor=colors.HexColor('#666666'),
         spaceAfter=20,
-        alignment=TA_CENTER,
-        fontName='Helvetica'
-    )
-    
-    # Adicionar título
-    title_text = title if title else "Relatório de Dados"
-    elements.append(Paragraph(title_text, title_style))
-    
-    # Adicionar data
-    current_date = datetime.now().strftime("%d de %B de %Y")
-    elements.append(Paragraph(current_date, date_style))
-    elements.append(Spacer(1, 0.3*inch))
-    
-    # Preparar dados da tabela
-    if not data:
-        no_data_style = ParagraphStyle(
-            'NoData',
-            parent=styles['Normal'],
-            fontSize=12,
-            textColor=colors.HexColor('#86868b'),
-            alignment=TA_CENTER
-        )
-        elements.append(Paragraph("Nenhum dado encontrado", no_data_style))
-    else:
-        # Cabeçalhos
-        table_data = [[Paragraph(f"<b>{field}</b>", styles['Normal']) 
-                      for field in fields]]
-        
-        # Dados
-        for row in data:
-            table_row = []
-            for field in fields:
-                value = str(row.get(field, ''))
-                if len(value) > 50:
-                    value = value[:47] + '...'
-                table_row.append(Paragraph(value, styles['Normal']))
-            table_data.append(table_row)
-        
-        # Criar tabela
-        col_widths = [A4[0] / len(fields) - 1.2*inch/len(fields)] * len(fields)
-        table = Table(table_data, colWidths=col_widths, repeatRows=1)
-        
-        # Estilo Apple: limpo, minimalista, com linhas sutis
-        table.setStyle(TableStyle([
-            # Cabeçalho
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#f5f5f7')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.HexColor('#1d1d1f')),
-            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 11),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-            ('TOPPADDING', (0, 0), (-1, 0), 12),
-            
-            # Corpo
-            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-            ('FONTSIZE', (0, 1), (-1, -1), 10),
-            ('TEXTCOLOR', (0, 1), (-1, -1), colors.HexColor('#1d1d1f')),
-            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#fafafa')]),
-            ('TOPPADDING', (0, 1), (-1, -1), 8),
-            ('BOTTOMPADDING', (0, 1), (-1, -1), 8),
-            
-            # Bordas sutis
-            ('LINEBELOW', (0, 0), (-1, 0), 1.5, colors.HexColor('#d2d2d7')),
-            ('LINEBELOW', (0, 1), (-1, -1), 0.5, colors.HexColor('#e5e5e7')),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ]))
-        
-        elements.append(table)
-    
-    # Adicionar rodapé
-    elements.append(Spacer(1, 0.5*inch))
-    footer_style = ParagraphStyle(
-        'Footer',
-        parent=styles['Normal'],
-        fontSize=8,
-        textColor=colors.HexColor('#86868b'),
         alignment=TA_CENTER
     )
-    footer_text = f"Gerado em {datetime.now().strftime('%d/%m/%Y às %H:%M')}"
-    elements.append(Paragraph(footer_text, footer_style))
+    
+    title = Paragraph(f"Relatório: {sanitize_text(table_name)}", title_style)
+    elements.append(title)
+    
+    date_text = f"Gerado em: {datetime.now().strftime('%d/%m/%Y às %H:%M')}"
+    subtitle = Paragraph(date_text, subtitle_style)
+    elements.append(subtitle)
+    elements.append(Spacer(1, 0.5*cm))
+    
+    if not data:
+        no_data = Paragraph("Nenhum dado encontrado.", styles['Normal'])
+        elements.append(no_data)
+    else:
+        headers = [sanitize_text(field).upper() for field in fields]
+        table_data = [headers]
+        
+        for row in data:
+            row_data = []
+            for field in fields:
+                value = row.get(field, "-")
+                formatted_value = format_value(value)
+                row_data.append(sanitize_text(formatted_value))
+            table_data.append(row_data)
+        
+        page_width = pagesize[0] - 4*cm
+        col_width = page_width / len(fields)
+        
+        table = Table(table_data, colWidths=[col_width] * len(fields))
+        
+        table_style = TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2c3e50')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('TOPPADDING', (0, 0), (-1, 0), 12),
+            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 1), (-1, -1), 9),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f8f9fa')]),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#dee2e6')),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 8),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 1), (-1, -1), 8),
+            ('BOTTOMPADDING', (0, 1), (-1, -1), 8),
+        ])
+        
+        table.setStyle(table_style)
+        elements.append(table)
+        
+        elements.append(Spacer(1, 1*cm))
+        footer_text = f"Total de registros: {len(data)}"
+        footer = Paragraph(footer_text, subtitle_style)
+        elements.append(footer)
     
     doc.build(elements)
     buffer.seek(0)
     return buffer
 
-@app.get("/")
-async def root():
-    """Endpoint raiz - informações da API"""
-    return {
-        "message": "API de Geração de Relatórios PDF com Supabase",
-        "version": "1.0.0",
-        "docs": "/docs",
-        "health": "/health",
-        "endpoint": "POST /generate-report"
-    }
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat()
-    }
-
-@app.post("/generate-report")
-async def generate_report(request: ReportRequest):
-    """
-    Gera um relatório PDF com dados do Supabase
-    
-    - **table_name**: Nome da tabela no Supabase
-    - **fields**: Lista de campos a serem incluídos no relatório
-    - **supabase_url**: URL do projeto Supabase
-    - **anon_key**: Chave anon do Supabase
-    - **report_title**: Título opcional do relatório
-    """
+@app.route('/generate-pdf', methods=['POST'])
+def generate_pdf():
+    """Endpoint principal para gerar PDF e fazer upload"""
     try:
+        data = request.json
+        
+        required_fields = ['table_name', 'fields', 'supabase_url', 'anon_key', 'bucket_name']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({'error': f'Campo obrigatório ausente: {field}'}), 400
+        
+        table_name = data['table_name']
+        fields = data['fields']
+        supabase_url = data['supabase_url']
+        anon_key = data['anon_key']
+        bucket_name = data['bucket_name']
+        folder = data.get('folder', '')  # Pasta opcional
+        
+        if not isinstance(fields, list) or len(fields) == 0:
+            return jsonify({'error': 'O campo "fields" deve ser uma lista não vazia'}), 400
+        
         # Conectar ao Supabase
-        supabase: Client = create_client(request.supabase_url, request.anon_key)
+        try:
+            supabase = create_client(supabase_url, anon_key)
+        except Exception as e:
+            return jsonify({'error': f'Erro ao conectar com Supabase: {str(e)}'}), 400
         
-        # Buscar dados
-        response = supabase.table(request.table_name).select(','.join(request.fields)).execute()
-        
-        if not response.data:
-            data = []
-        else:
-            data = response.data
+        # Buscar dados da tabela
+        try:
+            response = supabase.table(table_name).select(','.join(fields)).execute()
+            table_data = response.data
+        except Exception as e:
+            return jsonify({'error': f'Erro ao buscar dados: {str(e)}'}), 400
         
         # Gerar PDF
-        pdf_buffer = create_apple_style_pdf(
-            data, 
-            request.fields,
-            request.report_title or f"Relatório - {request.table_name}"
-        )
+        pdf_buffer = create_pdf(table_data, table_name, fields)
         
-        # Retornar PDF
-        filename = f"relatorio_{request.table_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        # Nome do arquivo
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"{table_name}_{timestamp}.pdf"
         
-        return StreamingResponse(
-            pdf_buffer,
-            media_type="application/pdf",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
-        )
+        # Adicionar pasta ao caminho se fornecida
+        if folder:
+            folder = folder.strip('/')
+            file_path = f"{folder}/{filename}"
+        else:
+            file_path = filename
+        
+        # Upload para o Supabase Storage
+        try:
+            pdf_bytes = pdf_buffer.getvalue()
+            
+            upload_response = supabase.storage.from_(bucket_name).upload(
+                path=file_path,
+                file=pdf_bytes,
+                file_options={"content-type": "application/pdf"}
+            )
+            
+            # Gerar URL pública
+            public_url = supabase.storage.from_(bucket_name).get_public_url(file_path)
+            
+            return jsonify({
+                'success': True,
+                'pdf_link': public_url,
+                'filename': filename,
+                'path': file_path,
+                'records_count': len(table_data),
+                'generated_at': datetime.now().isoformat()
+            }), 200
+            
+        except Exception as e:
+            return jsonify({'error': f'Erro ao fazer upload do PDF: {str(e)}'}), 500
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao gerar relatório: {str(e)}")
+        return jsonify({'error': f'Erro interno: {str(e)}'}), 500
 
-# Para desenvolvimento local
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+@app.route('/health', methods=['GET'])
+def health():
+    """Endpoint de verificação de saúde"""
+    return jsonify({'status': 'ok', 'message': 'API funcionando corretamente'}), 200
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
